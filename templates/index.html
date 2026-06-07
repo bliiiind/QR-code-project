@@ -1,0 +1,175 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>QR Text Transfer</title>
+    <link rel="stylesheet" href="/static/style.css" />
+  </head>
+  <body>
+    <main class="app">
+      <section class="panel">
+        <h1>QR Text Transfer</h1>
+        <label>
+          Message text
+          <textarea id="message"></textarea>
+        </label>
+        <label>
+          Frame interval, ms
+          <input id="interval" type="number" min="40" step="10" value="80" />
+        </label>
+        <label>
+          Encoded chars per QR frame
+          <input id="chunkSize" type="number" min="64" max="2500" step="100" value="1600" />
+        </label>
+        <div class="controls">
+          <button id="submit">Encode</button>
+          <button id="sample" class="secondary">Sample</button>
+          <button id="play" class="secondary">Play</button>
+          <button id="pause" class="secondary">Pause</button>
+        </div>
+        <div id="stats" class="stats"></div>
+      </section>
+      <section class="stage">
+        <div class="statusbar">
+          <strong id="frameLabel">No frame</strong>
+          <span id="checksum"></span>
+        </div>
+        <div class="qr-wrap">
+          <img id="qrImage" alt="QR frame" />
+        </div>
+        <div id="payload" class="payload"></div>
+      </section>
+    </main>
+    <script>
+      const message = document.querySelector("#message");
+      const interval = document.querySelector("#interval");
+      const chunkSize = document.querySelector("#chunkSize");
+      const stats = document.querySelector("#stats");
+      const qrImage = document.querySelector("#qrImage");
+      const frameLabel = document.querySelector("#frameLabel");
+      const checksum = document.querySelector("#checksum");
+      const payloadBox = document.querySelector("#payload");
+
+      let frames = [];
+      let timer = null;
+      let current = 0;
+      let lastVersion = -1;
+      let dirty = false;
+
+      function sampleText() {
+        const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 ";
+        let text = "QR transfer demo: ";
+        for (let i = 0; i < 2400; i += 1) {
+          text += alphabet[i % alphabet.length];
+        }
+        return text;
+      }
+
+      async function submitMessage() {
+        const text = message.value.trim();
+        if (!text) {
+          stats.textContent = "Enter text before encoding.";
+          return;
+        }
+        stop();
+        stats.textContent = "Encoding...";
+        const response = await fetch("/api/message", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            text,
+            chunk_size: Number(chunkSize.value || 1600),
+          }),
+        });
+        const data = await response.json();
+        if (!response.ok) {
+          stats.textContent = data.error || "Encode failed.";
+          return;
+        }
+        dirty = false;
+        applyMessage(data);
+        play();
+      }
+
+      function applyMessage(data) {
+        lastVersion = data.version;
+        frames = data.frames || [];
+        current = 0;
+        if (!dirty) {
+          message.value = data.frame_count ? data.text : "";
+        }
+        stats.textContent = data.frame_count
+          ? `${data.source} input: ${data.char_length} characters, ${data.byte_length} bytes, ${data.frame_count} QR frames, server encode ${data.encode_ms} ms`
+          : "Enter text here or type in the server terminal, then press Enter.";
+        showFrame(0);
+      }
+
+      async function pollCurrent() {
+        const response = await fetch("/api/current", { cache: "no-store" });
+        const data = await response.json();
+        if (data.version === lastVersion) {
+          return;
+        }
+        applyMessage(data);
+        if (frames.length && !timer) {
+          play();
+        }
+      }
+
+      function showFrame(index) {
+        if (!frames.length) {
+          frameLabel.textContent = "No frame";
+          checksum.textContent = "";
+          payloadBox.textContent = "";
+          qrImage.removeAttribute("src");
+          return;
+        }
+        const frame = frames[index % frames.length];
+        qrImage.src = frame.png_data_url;
+        frameLabel.textContent = `Frame ${frame.index + 1} / ${frame.total}`;
+        checksum.textContent = `CRC32 ${frame.checksum}`;
+        payloadBox.textContent = frame.payload;
+      }
+
+      function play() {
+        if (!frames.length) {
+          pollCurrent().then(play);
+          return;
+        }
+        stop();
+        timer = window.setInterval(() => {
+          current = (current + 1) % frames.length;
+          showFrame(current);
+        }, Math.max(40, Number(interval.value || 80)));
+      }
+
+      function stop() {
+        if (timer) {
+          window.clearInterval(timer);
+          timer = null;
+        }
+      }
+
+      document.querySelector("#play").addEventListener("click", play);
+      document.querySelector("#pause").addEventListener("click", stop);
+      document.querySelector("#submit").addEventListener("click", submitMessage);
+      document.querySelector("#sample").addEventListener("click", () => {
+        message.value = sampleText();
+        dirty = true;
+      });
+      message.addEventListener("input", () => {
+        dirty = true;
+      });
+      message.addEventListener("keydown", (event) => {
+        if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
+          event.preventDefault();
+          submitMessage();
+        }
+      });
+
+      pollCurrent();
+      window.setInterval(pollCurrent, 500);
+    </script>
+  </body>
+</html>
