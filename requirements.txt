@@ -1,6 +1,6 @@
 flask>=3.0
 numpy>=2.0
-opencv-python>=4.10
+opencv-python-headless>=4.10
 pillow>=10.0
 qrcode[pil]>=8.0
 zxing-cpp>=3.0

@@ -9,7 +9,7 @@ from pathlib import Path
 from urllib import request as urlrequest
 
 import numpy as np
-from PIL import Image, ImageGrab
+from PIL import Image
 
 from qr_transfer import DEFAULT_CHUNK_SIZE, Frame, ProtocolError, assemble_frames, make_qr_png, parse_payload, split_text
 
@@ -153,6 +153,8 @@ def consume_payloads(
 
 
 def capture_screen(interval: float, timeout: float | None) -> tuple[str, CaptureStats]:
+    from PIL import ImageGrab
+
     frames: dict[tuple[str, int], Frame] = {}
     stats = CaptureStats.start()
     deadline = time.time() + timeout if timeout else None
@@ -165,16 +167,41 @@ def capture_screen(interval: float, timeout: float | None) -> tuple[str, Capture
     raise TimeoutError("timed out before all frames were captured")
 
 
-def capture_camera(camera_index: int, interval: float, timeout: float | None) -> tuple[str, CaptureStats]:
+def camera_source(value: str) -> int | str:
+    try:
+        return int(value)
+    except ValueError:
+        return value
+
+
+def capture_camera(
+    camera: int | str,
+    interval: float,
+    timeout: float | None,
+    width: int | None = None,
+    height: int | None = None,
+    fps: int | None = None,
+    warmup_frames: int = 5,
+) -> tuple[str, CaptureStats]:
     import cv2
     frames: dict[tuple[str, int], Frame] = {}
     stats = CaptureStats.start()
-    capture = cv2.VideoCapture(camera_index)
+    capture = cv2.VideoCapture(camera)
     if not capture.isOpened():
-        raise RuntimeError(f"could not open camera {camera_index}")
+        raise RuntimeError(f"could not open camera {camera}")
+
+    if width:
+        capture.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+    if height:
+        capture.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+    if fps:
+        capture.set(cv2.CAP_PROP_FPS, fps)
 
     deadline = time.time() + timeout if timeout else None
     try:
+        for _ in range(max(0, warmup_frames)):
+            capture.read()
+
         while deadline is None or time.time() < deadline:
             ok, image = capture.read()
             if not ok:
@@ -257,7 +284,11 @@ def benchmark_local(char_count: int, chunk_size: int) -> tuple[str, CaptureStats
 def main() -> int:
     parser = argparse.ArgumentParser(description="QR text transfer client")
     parser.add_argument("--screen", action="store_true", help="capture QR frames from screen")
-    parser.add_argument("--camera", type=int, help="capture QR frames from camera index")
+    parser.add_argument("--camera", help="capture QR frames from camera index or Linux device path, e.g. 0 or /dev/video0")
+    parser.add_argument("--camera-width", type=int, help="requested camera capture width")
+    parser.add_argument("--camera-height", type=int, help="requested camera capture height")
+    parser.add_argument("--camera-fps", type=int, help="requested camera capture FPS")
+    parser.add_argument("--camera-warmup-frames", type=int, default=5, help="discard initial camera frames before decoding")
     parser.add_argument("--image", nargs="*", type=Path, help="decode one or more saved QR PNGs")
     parser.add_argument("--simulate-url", help="server base URL for protocol simulation")
     parser.add_argument("--text-file", type=Path, help="text file used with --simulate-url")
@@ -273,7 +304,15 @@ def main() -> int:
         if args.screen:
             text, stats = capture_screen(args.interval, args.timeout)
         elif args.camera is not None:
-            text, stats = capture_camera(args.camera, args.interval, args.timeout)
+            text, stats = capture_camera(
+                camera_source(args.camera),
+                args.interval,
+                args.timeout,
+                width=args.camera_width,
+                height=args.camera_height,
+                fps=args.camera_fps,
+                warmup_frames=args.camera_warmup_frames,
+            )
         elif args.image:
             text, stats = decode_images(args.image)
         elif args.simulate_url and args.text_file:
