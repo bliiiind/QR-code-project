@@ -122,7 +122,7 @@ def split_text(text: str, chunk_size: int = DEFAULT_CHUNK_SIZE) -> list[Frame]:
 
 
 def parse_payload(payload: str) -> Frame:
-    parts = payload.strip().split(":", 6)
+    parts = payload.strip("\r\n").split(":", 6)
     if len(parts) == 7 and parts[0] == PROTOCOL:
         _, message_id, index, total, checksum, codec, chunk_code = parts
     elif len(parts) == 6 and parts[0] == LEGACY_PROTOCOL:

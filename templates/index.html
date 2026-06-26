@@ -16,14 +16,28 @@
         </label>
         <label>
           Frame interval, ms
-          <input id="interval" type="number" min="40" step="10" value="80" />
+          <input id="interval" type="number" min="50" step="10" value="100" />
         </label>
         <label>
           Encoded chars per QR frame
           <input id="chunkSize" type="number" min="64" max="2500" step="100" value="1600" />
         </label>
+        <label>
+          Text file sample
+          <input id="textFile" type="file" accept=".txt,text/plain" />
+        </label>
+        <label>
+          Speech language
+          <select id="speechLang">
+            <option value="zh-CN">Chinese</option>
+            <option value="en-US">English</option>
+          </select>
+        </label>
         <div class="controls">
           <button id="submit">Encode</button>
+          <button id="submitFile" class="secondary">Encode File</button>
+          <button id="voice" class="secondary">Voice</button>
+          <button id="stopVoice" class="secondary">Stop Voice</button>
           <button id="sample" class="secondary">Sample</button>
           <button id="play" class="secondary">Play</button>
           <button id="pause" class="secondary">Pause</button>
@@ -45,17 +59,28 @@
       const message = document.querySelector("#message");
       const interval = document.querySelector("#interval");
       const chunkSize = document.querySelector("#chunkSize");
+      const textFile = document.querySelector("#textFile");
+      const speechLang = document.querySelector("#speechLang");
       const stats = document.querySelector("#stats");
       const qrImage = document.querySelector("#qrImage");
       const frameLabel = document.querySelector("#frameLabel");
       const checksum = document.querySelector("#checksum");
       const payloadBox = document.querySelector("#payload");
+      const voiceButton = document.querySelector("#voice");
+      const stopVoiceButton = document.querySelector("#stopVoice");
+      const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
 
       let frames = [];
       let timer = null;
       let current = 0;
       let lastVersion = -1;
+      let lastGenerated = -1;
+      let lastEncoding = false;
+      let playing = false;
       let dirty = false;
+      let recognition = null;
+      let listening = false;
+      let voiceBaseText = "";
 
       function sampleText() {
         const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 ";
@@ -66,6 +91,77 @@
         return text;
       }
 
+      function composeVoiceText(transcript) {
+        const base = voiceBaseText.trimEnd();
+        if (!base) {
+          return transcript.trimStart();
+        }
+        if (!transcript.trim()) {
+          return base;
+        }
+        return `${base}\n${transcript.trimStart()}`;
+      }
+
+      function startVoiceInput() {
+        if (!SpeechRecognition) {
+          stats.textContent = "Speech recognition is not supported by this browser.";
+          return;
+        }
+        if (recognition) {
+          recognition.stop();
+        }
+
+        recognition = new SpeechRecognition();
+        recognition.lang = speechLang.value || "zh-CN";
+        recognition.continuous = true;
+        recognition.interimResults = true;
+        voiceBaseText = message.value;
+        listening = true;
+        voiceButton.disabled = true;
+        stopVoiceButton.disabled = false;
+        stats.textContent = "Listening...";
+
+        recognition.addEventListener("result", (event) => {
+          let finalText = "";
+          let interimText = "";
+          for (let i = 0; i < event.results.length; i += 1) {
+            const transcript = event.results[i][0].transcript;
+            if (event.results[i].isFinal) {
+              finalText += transcript;
+            } else {
+              interimText += transcript;
+            }
+          }
+          message.value = composeVoiceText(finalText + interimText);
+          dirty = true;
+          stats.textContent = interimText ? "Listening..." : "Voice text captured.";
+        });
+
+        recognition.addEventListener("error", (event) => {
+          listening = false;
+          voiceButton.disabled = false;
+          stopVoiceButton.disabled = true;
+          stats.textContent = `Speech recognition error: ${event.error}`;
+        });
+
+        recognition.addEventListener("end", () => {
+          listening = false;
+          voiceButton.disabled = false;
+          stopVoiceButton.disabled = true;
+          if (stats.textContent === "Listening...") {
+            stats.textContent = message.value.trim() ? "Voice text captured." : "Voice input stopped.";
+          }
+        });
+
+        recognition.start();
+      }
+
+      function stopVoiceInput() {
+        if (recognition && listening) {
+          recognition.stop();
+        }
+      }
+
       async function submitMessage() {
         const text = message.value.trim();
         if (!text) {
@@ -73,6 +169,9 @@
           return;
         }
         stop();
+        frames = [];
+        current = 0;
+        lastGenerated = -1;
         stats.textContent = "Encoding...";
         const response = await fetch("/api/message", {
           method: "POST",
@@ -89,31 +188,74 @@
         }
         dirty = false;
         applyMessage(data);
-        play();
+        play(true);
+      }
+
+      async function submitFile() {
+        const file = textFile.files && textFile.files[0];
+        if (!file) {
+          stats.textContent = "Choose a text file before encoding.";
+          return;
+        }
+        stop();
+        frames = [];
+        current = 0;
+        lastGenerated = -1;
+        stats.textContent = "Uploading and encoding file...";
+        const body = new FormData();
+        body.append("file", file);
+        body.append("chunk_size", String(Number(chunkSize.value || 1600)));
+        const response = await fetch("/api/message-file", {
+          method: "POST",
+          body,
+        });
+        const data = await response.json();
+        if (!response.ok) {
+          stats.textContent = data.error || "File encode failed.";
+          return;
+        }
+        dirty = false;
+        applyMessage(data);
+        play(true);
       }
 
       function applyMessage(data) {
+        const changedVersion = data.version !== lastVersion;
+        const completedEncoding = lastEncoding && !data.encoding;
         lastVersion = data.version;
+        lastGenerated = data.generated_frame_count || 0;
+        lastEncoding = Boolean(data.encoding);
         frames = data.frames || [];
-        current = 0;
+        if (!playing || changedVersion) {
+          current = 0;
+        }
         if (!dirty) {
           message.value = data.frame_count ? data.text : "";
         }
+        const encodeText = data.encoding
+          ? `generating ${data.generated_frame_count || 0}/${data.frame_count}`
+          : `server encode ${data.encode_ms} ms`;
         stats.textContent = data.frame_count
-          ? `${data.source} input: ${data.char_length} characters, ${data.byte_length} bytes, ${data.frame_count} QR frames, server encode ${data.encode_ms} ms`
+          ? `${data.source} input: ${data.char_length} characters, ${data.byte_length} bytes, ${data.frame_count} QR frames, ${encodeText}`
           : "Enter text here or type in the server terminal, then press Enter.";
-        showFrame(0);
+        if (!playing || current >= frames.length) {
+          showFrame(0);
+        }
+        if (frames.length && completedEncoding) {
+          play(true);
+        }
       }
 
       async function pollCurrent() {
         const response = await fetch("/api/current", { cache: "no-store" });
         const data = await response.json();
-        if (data.version === lastVersion) {
+        if (data.version === lastVersion && (data.generated_frame_count || 0) === lastGenerated) {
           return;
         }
+        const changedVersion = data.version !== lastVersion;
         applyMessage(data);
-        if (frames.length && !timer) {
-          play();
+        if (frames.length && !playing) {
+          play(changedVersion);
         }
       }
 
@@ -132,28 +274,42 @@
         payloadBox.textContent = frame.payload;
       }
 
-      function play() {
-        if (!frames.length) {
-          pollCurrent().then(play);
-          return;
-        }
+      function play(reset = false) {
         stop();
-        timer = window.setInterval(() => {
-          current = (current + 1) % frames.length;
+        playing = true;
+        if (reset) {
+          current = 0;
           showFrame(current);
-        }, Math.max(40, Number(interval.value || 80)));
+        }
+        const tick = () => {
+          if (!playing) {
+            return;
+          }
+          if (frames.length) {
+            current = (current + 1) % frames.length;
+            showFrame(current);
+          } else {
+            frameLabel.textContent = "Waiting for first frame";
+          }
+          timer = window.setTimeout(tick, Math.max(50, Number(interval.value || 100)));
+        };
+        timer = window.setTimeout(tick, Math.max(50, Number(interval.value || 100)));
       }
 
       function stop() {
+        playing = false;
         if (timer) {
-          window.clearInterval(timer);
+          window.clearTimeout(timer);
           timer = null;
         }
       }
 
-      document.querySelector("#play").addEventListener("click", play);
+      document.querySelector("#play").addEventListener("click", () => play(true));
       document.querySelector("#pause").addEventListener("click", stop);
       document.querySelector("#submit").addEventListener("click", submitMessage);
+      document.querySelector("#submitFile").addEventListener("click", submitFile);
+      voiceButton.addEventListener("click", startVoiceInput);
+      stopVoiceButton.addEventListener("click", stopVoiceInput);
       document.querySelector("#sample").addEventListener("click", () => {
         message.value = sampleText();
         dirty = true;
@@ -168,8 +324,14 @@
         }
       });
 
+      if (!SpeechRecognition) {
+        voiceButton.disabled = true;
+        stopVoiceButton.disabled = true;
+      } else {
+        stopVoiceButton.disabled = true;
+      }
       pollCurrent();
-      window.setInterval(pollCurrent, 500);
+      window.setInterval(pollCurrent, 50);
     </script>
   </body>
 </html>

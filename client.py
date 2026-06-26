@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import io
 import json
 import sys
 import time
@@ -9,12 +11,28 @@ from pathlib import Path
 from urllib import request as urlrequest
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageGrab
 
 from qr_transfer import DEFAULT_CHUNK_SIZE, Frame, ProtocolError, assemble_frames, make_qr_png, parse_payload, split_text
 
 
 USE_GPU_ACCELERATION = False
+DEFAULT_CAPTURE_INTERVAL = 1 / 60
+DEFAULT_PLAYBACK_INTERVAL = 1 / 10
+TEXT_ENCODINGS = ("utf-8-sig", "utf-8", "gb18030", "gbk", "big5")
+
+
+def completed_message_ids(frames: dict[tuple[str, int], Frame]) -> set[str]:
+    by_id: dict[str, set[int]] = {}
+    totals: dict[str, int] = {}
+    for frame in frames.values():
+        by_id.setdefault(frame.message_id, set()).add(frame.index)
+        totals[frame.message_id] = frame.total
+    return {
+        message_id
+        for message_id, indexes in by_id.items()
+        if len(indexes) >= totals.get(message_id, 0)
+    }
 
 
 @dataclass
@@ -78,8 +96,51 @@ def configure_acceleration(use_gpu: bool) -> str:
         return f"GPU acceleration: unavailable ({exc}); using optimized CPU path"
 
 
+def read_text_file(path: Path) -> tuple[str, str]:
+    data = path.read_bytes()
+    for encoding in TEXT_ENCODINGS:
+        try:
+            return data.decode(encoding), encoding
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", errors="replace"), "utf-8-replace"
+
+
 def decode_payloads_from_image(image: Image.Image) -> list[str]:
+    payloads, _ = decode_payloads_and_bbox_from_image(image)
+    return payloads
+
+
+def _bbox_from_points(points: list[tuple[float, float]]) -> tuple[int, int, int, int] | None:
+    if not points:
+        return None
+    xs = [point[0] for point in points]
+    ys = [point[1] for point in points]
+    return int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys))
+
+
+def _expand_screen_bbox(
+    local_bbox: tuple[int, int, int, int],
+    origin: tuple[int, int],
+    screen_size: tuple[int, int],
+) -> tuple[int, int, int, int]:
+    left, top, right, bottom = local_bbox
+    width = max(1, right - left)
+    height = max(1, bottom - top)
+    padding = max(80, int(max(width, height) * 0.25))
+    origin_x, origin_y = origin
+    screen_width, screen_height = screen_size
+    return (
+        max(0, origin_x + left - padding),
+        max(0, origin_y + top - padding),
+        min(screen_width, origin_x + right + padding),
+        min(screen_height, origin_y + bottom + padding),
+    )
+
+
+def decode_payloads_and_bbox_from_image(image: Image.Image) -> tuple[list[str], tuple[int, int, int, int] | None]:
     payloads: list[str] = []
+    bbox: tuple[int, int, int, int] | None = None
     try:
         import zxingcpp
 
@@ -87,10 +148,20 @@ def decode_payloads_from_image(image: Image.Image) -> list[str]:
             text = getattr(barcode, "text", "")
             if text:
                 payloads.append(text)
+                position = getattr(barcode, "position", None)
+                if bbox is None and position is not None:
+                    bbox = _bbox_from_points(
+                        [
+                            (position.top_left.x, position.top_left.y),
+                            (position.top_right.x, position.top_right.y),
+                            (position.bottom_right.x, position.bottom_right.y),
+                            (position.bottom_left.x, position.bottom_left.y),
+                        ]
+                    )
     except Exception:
         pass
     if payloads:
-        return list(dict.fromkeys(payloads))
+        return list(dict.fromkeys(payloads)), bbox
 
     import cv2
     rgb = np.array(image.convert("RGB"))
@@ -108,12 +179,18 @@ def decode_payloads_from_image(image: Image.Image) -> list[str]:
         ok, decoded, _, _ = detector.detectAndDecodeMulti(bgr)
         if ok:
             payloads.extend(item for item in decoded if item)
+            if bbox is None:
+                detected, points = detector.detectMulti(bgr)
+                if detected and points is not None and len(points):
+                    bbox = _bbox_from_points([(float(x), float(y)) for x, y in points[0]])
 
-        single, _, _ = detector.detectAndDecode(bgr)
+        single, points, _ = detector.detectAndDecode(bgr)
         if single:
             payloads.append(single)
+            if bbox is None and points is not None and len(points):
+                bbox = _bbox_from_points([(float(x), float(y)) for x, y in points.reshape(-1, 2)])
 
-    return list(dict.fromkeys(payloads))
+    return list(dict.fromkeys(payloads)), bbox
 
 
 def consume_payloads(
@@ -122,17 +199,28 @@ def consume_payloads(
     stats: CaptureStats | None = None,
 ) -> str | None:
     changed = False
+    completed_before = completed_message_ids(frames)
     for payload in payloads:
         try:
             frame = parse_payload(payload)
         except ProtocolError:
             continue
+
         key = (frame.message_id, frame.index)
-        if key not in frames:
+        existing = frames.get(key)
+        if existing is None:
             frames[key] = frame
             if stats is not None:
                 stats.mark_frame(frame)
             changed = True
+        elif existing.payload != frame.payload:
+            frames[key] = frame
+            changed = True
+            print(
+                f"replaced frame {frame.index + 1}/{frame.total} for {frame.message_id}; "
+                "previous payload did not match latest decode",
+                flush=True,
+            )
 
     if changed:
         by_id: dict[str, set[int]] = {}
@@ -148,61 +236,58 @@ def consume_payloads(
 
     text = assemble_frames(frames.values())
     if text is not None and stats is not None:
+        if stats.completed_at is None:
+            print("decode complete; CRC verified", flush=True)
         stats.mark_complete()
+    elif changed:
+        for message_id in sorted(completed_message_ids(frames) - completed_before):
+            print(
+                f"captured {message_id}: all frame indexes received, but CRC/decode failed; "
+                "continuing to refresh frames from the next playback loop",
+                flush=True,
+            )
     return text
 
 
-def capture_screen(interval: float, timeout: float | None) -> tuple[str, CaptureStats]:
-    from PIL import ImageGrab
-
+def capture_screen(
+    interval: float,
+) -> tuple[str, CaptureStats]:
     frames: dict[tuple[str, int], Frame] = {}
     stats = CaptureStats.start()
-    deadline = time.time() + timeout if timeout else None
-    while deadline is None or time.time() < deadline:
-        payloads = decode_payloads_from_image(ImageGrab.grab())
+    bbox: tuple[int, int, int, int] | None = None
+    screen_size: tuple[int, int] | None = None
+    while True:
+        image = ImageGrab.grab(bbox=bbox)
+        if screen_size is None:
+            screen_size = image.size
+
+        if bbox is None:
+            payloads, local_bbox = decode_payloads_and_bbox_from_image(image)
+        else:
+            payloads = decode_payloads_from_image(image)
+            local_bbox = None
+
+        if bbox is None and local_bbox is not None and screen_size is not None:
+            origin = (bbox[0], bbox[1]) if bbox is not None else (0, 0)
+            bbox = _expand_screen_bbox(local_bbox, origin, screen_size)
+            print(f"auto screen crop: {bbox[0]},{bbox[1]},{bbox[2]},{bbox[3]}", flush=True)
+
         text = consume_payloads(payloads, frames, stats)
         if text is not None:
             return text, stats
         time.sleep(interval)
-    raise TimeoutError("timed out before all frames were captured")
 
 
-def camera_source(value: str) -> int | str:
-    try:
-        return int(value)
-    except ValueError:
-        return value
-
-
-def capture_camera(
-    camera: int | str,
-    interval: float,
-    timeout: float | None,
-    width: int | None = None,
-    height: int | None = None,
-    fps: int | None = None,
-    warmup_frames: int = 5,
-) -> tuple[str, CaptureStats]:
+def capture_camera(camera_index: int, interval: float) -> tuple[str, CaptureStats]:
     import cv2
     frames: dict[tuple[str, int], Frame] = {}
     stats = CaptureStats.start()
-    capture = cv2.VideoCapture(camera)
+    capture = cv2.VideoCapture(camera_index)
     if not capture.isOpened():
-        raise RuntimeError(f"could not open camera {camera}")
+        raise RuntimeError(f"could not open camera {camera_index}")
 
-    if width:
-        capture.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-    if height:
-        capture.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-    if fps:
-        capture.set(cv2.CAP_PROP_FPS, fps)
-
-    deadline = time.time() + timeout if timeout else None
     try:
-        for _ in range(max(0, warmup_frames)):
-            capture.read()
-
-        while deadline is None or time.time() < deadline:
+        while True:
             ok, image = capture.read()
             if not ok:
                 time.sleep(interval)
@@ -217,8 +302,6 @@ def capture_camera(
     finally:
         capture.release()
 
-    raise TimeoutError("timed out before all frames were captured")
-
 
 def decode_images(paths: list[Path]) -> tuple[str, CaptureStats]:
     frames: dict[tuple[str, int], Frame] = {}
@@ -231,7 +314,14 @@ def decode_images(paths: list[Path]) -> tuple[str, CaptureStats]:
     raise RuntimeError("not enough valid QR frames found in supplied images")
 
 
-def simulate_from_server(url: str, text: str, chunk_size: int) -> tuple[str, CaptureStats]:
+def decode_png_data_url(data_url: str) -> Image.Image:
+    _, _, encoded = data_url.partition(",")
+    if not encoded:
+        encoded = data_url
+    return Image.open(io.BytesIO(base64.b64decode(encoded)))
+
+
+def simulate_from_server(url: str, text: str, chunk_size: int, playback_interval: float) -> tuple[str, CaptureStats]:
     stats = CaptureStats.start()
     body = json.dumps(
         {"text": text, "chunk_size": chunk_size, "include_png": True}
@@ -242,14 +332,17 @@ def simulate_from_server(url: str, text: str, chunk_size: int) -> tuple[str, Cap
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    with urlrequest.urlopen(req, timeout=20) as response:
+    with urlrequest.urlopen(req) as response:
         payload = json.loads(response.read().decode("utf-8"))
 
     frames: dict[tuple[str, int], Frame] = {}
     for item in payload["frames"]:
-        text = consume_payloads([item["payload"]], frames, stats)
+        image = decode_png_data_url(item["png_data_url"])
+        payloads = decode_payloads_from_image(image)
+        text = consume_payloads(payloads, frames, stats)
         if text is not None:
             return text, stats
+        time.sleep(playback_interval)
     raise RuntimeError("server returned incomplete frames")
 
 
@@ -284,42 +377,35 @@ def benchmark_local(char_count: int, chunk_size: int) -> tuple[str, CaptureStats
 def main() -> int:
     parser = argparse.ArgumentParser(description="QR text transfer client")
     parser.add_argument("--screen", action="store_true", help="capture QR frames from screen")
-    parser.add_argument("--camera", help="capture QR frames from camera index or Linux device path, e.g. 0 or /dev/video0")
-    parser.add_argument("--camera-width", type=int, help="requested camera capture width")
-    parser.add_argument("--camera-height", type=int, help="requested camera capture height")
-    parser.add_argument("--camera-fps", type=int, help="requested camera capture FPS")
-    parser.add_argument("--camera-warmup-frames", type=int, default=5, help="discard initial camera frames before decoding")
+    parser.add_argument("--camera", type=int, help="capture QR frames from camera index")
     parser.add_argument("--image", nargs="*", type=Path, help="decode one or more saved QR PNGs")
     parser.add_argument("--simulate-url", help="server base URL for protocol simulation")
     parser.add_argument("--text-file", type=Path, help="text file used with --simulate-url")
     parser.add_argument("--benchmark-chars", type=int, help="run local QR generation/recognition benchmark")
     parser.add_argument("--use-gpu", action="store_true", help="enable OpenCV GPU/OpenCL acceleration when available")
     parser.add_argument("--chunk-size", type=int, default=DEFAULT_CHUNK_SIZE)
-    parser.add_argument("--interval", type=float, default=0.02)
-    parser.add_argument("--timeout", type=float, default=60)
+    parser.add_argument("--interval", type=float, default=DEFAULT_CAPTURE_INTERVAL)
+    parser.add_argument("--playback-interval", type=float, default=DEFAULT_PLAYBACK_INTERVAL, help="simulated sender frame interval; default is 1/10 s")
     args = parser.parse_args()
     print(configure_acceleration(args.use_gpu), flush=True)
 
     try:
         if args.screen:
-            text, stats = capture_screen(args.interval, args.timeout)
-        elif args.camera is not None:
-            text, stats = capture_camera(
-                camera_source(args.camera),
+            text, stats = capture_screen(
                 args.interval,
-                args.timeout,
-                width=args.camera_width,
-                height=args.camera_height,
-                fps=args.camera_fps,
-                warmup_frames=args.camera_warmup_frames,
             )
+        elif args.camera is not None:
+            text, stats = capture_camera(args.camera, args.interval)
         elif args.image:
             text, stats = decode_images(args.image)
         elif args.simulate_url and args.text_file:
+            source_text, encoding = read_text_file(args.text_file)
+            print(f"text file encoding: {encoding}", flush=True)
             text, stats = simulate_from_server(
                 args.simulate_url,
-                args.text_file.read_text(encoding="utf-8"),
+                source_text,
                 args.chunk_size,
+                args.playback_interval,
             )
         elif args.benchmark_chars:
             text, stats, metrics = benchmark_local(args.benchmark_chars, args.chunk_size)
